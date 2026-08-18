@@ -557,12 +557,12 @@ function sanitizeOlderOptions(session, currentCallId) {
 
 /** 切换为自由对话模式时注入会话的持久指令（agent.inject：不唤醒，下一次请求可见）。 */
 const MODE_INJECT_OFF =
-  '选项卡片模式已关闭（玩家使用 /options 命令切换）：从现在起不要再调用 present_options。' +
-  '每轮回复以纯叙事结尾，叙事完成后直接停止输出，回合到此为止，等待玩家以普通消息描述行动。' +
+  '选项卡片模式已关闭：从现在起不要再调用 present_options。' +
+  '每轮回复以纯叙事结尾，不再输出选项，等待玩家以普通消息描述行动。' +
   '若你刚才习惯性地调用了 present_options，忽略其结果，按新模式继续。'
 /** 切换回选项卡片模式时注入会话的持久指令。 */
 const MODE_INJECT_ON =
-  '选项卡片模式已开启（玩家使用 /options 命令切换）：从现在起，每轮回复结束后调用 present_options，' +
+  '选项卡片模式已开启：从现在起，每轮回复结束后调用 present_options，' +
   '给出 0–4 个简明、互不重叠的行动选项把行动权交给玩家；玩家的选择作为工具结果返回后，你在同一回合内继续推进。'
 /** 自由对话模式下模型仍调用 present_options 时的纠正文案（作为工具结果返回，自愈式纠错）。 */
 const PLAIN_MODE_TOOL_REPLY =
@@ -856,7 +856,7 @@ function repairInterruptedHandoffs(session) {
 
 // ── 回合交接守卫 ────────────────────────────────────────────────────────────
 
-const GUARD_REMINDER = '回合交接检查：你还没有调用 present_options 把行动权交给玩家。请现在调用它（0–4 个选项；0 个表示请玩家自由描述行动），然后等待玩家作答。'
+const GUARD_REMINDER = '选项遗漏提醒：你还没有调用 present_options 生成选项。如果你确实忘了，请现在调用present_options工具（0–4 个选项；0 个仅用于**明确**不需要时占位）。'
 /** sessionId -> 已 steer 过的回合号（每回合最多提醒一次，防止死循环） */
 const steeredTurns = new Map()
 
@@ -969,7 +969,6 @@ function apply(ctx, config) {
       '跨调用保留：全局函数与全局对象 state自动持久化。' +
       '约定：所有需要追踪的游戏数据放进 state；辅助函数必须定义为全局函数才能跨调用保留：' +
       '用 globalThis.foo = function...（或裸赋值 foo = ...）。注意：程序体内的 function foo(){}、const、let 声明都是本次调用的局部量，调用结束即消失；' +
-      '钩子与后续调用只能引用 state、print、hooks 和全局函数。' +
       '代码作为 async 函数体执行，可用顶层 await/return。' +
       '输出：print(...值) 把任意值（可多个、含不可 JSON 化的对象）写入当次日志返回；return 返回单个值。注意return和钩子外的print会输出钩子执行前的值。钩子执行后的值会在state diff中自动返回' +
       '原子执行：代码出错时自动回滚到执行前（state、钩子注册、函数定义全部还原），不会留下半更新的状态。' +
@@ -985,7 +984,7 @@ function apply(ctx, config) {
       properties: {
         program: {
           type: 'string',
-          description: '要执行的 JavaScript 代码（async 函数体）。读取/修改 state，或定义全局函数供后续调用使用；如需查看具体字段，用 return 返回它。',
+          description: '要执行的 JavaScript 代码（async 函数体）。读取/修改 state，或定义全局函数供后续调用使用',
         },
         dry: {
           type: 'boolean',
@@ -1014,12 +1013,8 @@ function apply(ctx, config) {
   ctx.tools.register({
     name: 'present_options',
     description:
-      '把行动权交给玩家：弹出选择卡片展示 0–4 个行动选项，玩家也可以不理会选项自行输入（0 个选项 = 纯自由输入）。' +
-      '调用后阻塞等待玩家作答，答案作为本工具的结果返回，随后你在同一回合内继续推进：结算行动（需要数值/规则判定时用 world_run）、叙事，然后再次调用本工具等待下一步。' +
-      '玩家每次行动都应通过恰好一次本工具调用交接。' +
-      '在无交互界面的环境或玩家取消作答时，自动回退为结束回合、等待玩家以普通消息行动。' +
-      '模式开关：玩家可用 /options 命令关闭选项卡片（自由对话模式）；若会话中出现关闭模式的指令，则不要调用本工具——' +
-      '此时调用不会展示任何选项，只会收到纠正提醒并直接结束回合。',
+      '正文叙事完成后，弹出选择卡片展示 0–4 个行动选项，玩家回复作为本工具的结果返回。' +
+      '在没有明确禁用选项时，必须调用本工具并提供至少1个选项，上下文中之前的轮次没有遵循是系统裁剪的结果，只以明确指令为准，不模仿旧行为',
     parameters: {
       type: 'object',
       additionalProperties: false,
