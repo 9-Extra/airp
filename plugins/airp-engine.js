@@ -6,10 +6,10 @@
 //      每次执行只返回 state 的变化 diff，供模型确认更新并据此叙事；
 //      查看具体字段用 return 返回（例如 return state.hp），
 //      调试与批量输出用 print(...)（安全序列化，循环引用不炸）。
-//      命名钩子（hooks.add/remove/list/order/clear，源码与顺序落盘随会话恢复）在每次
-//      用户代码成功后、state diff 前自动按序运行：变量约束与阈值提醒
-//      （钩子内 print 即提醒），单钩子出错只回滚它自己的改动并记录。
-//      执行是原子的：用户代码出错自动整体回滚（state/钩子/函数定义）；
+//      约定式整理：若定义了全局函数 normalize()，在每次用户代码成功后、
+//      state diff 前自动调用——变量约束与阈值提醒（print 即提醒）写在里面，
+//      体内代码顺序即执行顺序；normalize 出错只回滚它自己的改动并记录。
+//      执行是原子的：用户代码出错自动整体回滚（state/函数定义）；
 //      传 dry:true 试运行——返回完整结果但一切变化不生效，供复杂更新前排错。
 //      状态持久化双通道：`.airp/` 文件（兜底/调试）+ `airp/state` 会话日志事件
 //      （log-only、ignorable，随 fork 切片被分支精确继承；需 dsh-session 补丁，
@@ -49,7 +49,7 @@ const name = 'airp-engine'
 const inject = ['tools', 'agents']
 
 const OPTIONS_TOOL = 'present_options'
-const SANITIZED_ARGUMENTS = '{"options":[]}'
+const SANITIZED_ARGUMENTS = '{"options":\"SANITIZED\"}'
 const DIFF_ENTRY_CAP = 60
 const VM_TIMEOUT_MS = 10000
 const ASYNC_TIMEOUT_MS = 30000
@@ -169,84 +169,25 @@ async function runtimeFor(agent) {
 
   const cwd = agent.session.header?.cwd
   const sandbox = {}
-  const injectedKeys = new Set(['state', 'console', 'print', 'hooks'])
+  const injectedKeys = new Set(['state', 'console', 'print'])
   const logs = { current: null }
   const consoleShim = {}
   for (const method of ['log', 'info', 'warn', 'error', 'debug']) {
     consoleShim[method] = (...parts) => pushLog(logs, parts.map(printPart).join(' '))
   }
-  // 命名自动钩子：name → 函数源码。Map 插入顺序即执行顺序；
-  // 源码随 .airp/<session>.hooks.json 落盘，恢复时重新编译校验。
-  const hooks = new Map()
   sandbox.state = {}
   sandbox.console = consoleShim
-  // print：唯一输出通道。用户代码与钩子共用，输出随当次结果的日志返回。
+  // print：唯一输出通道。用户代码与 normalize 整理函数共用，输出随当次结果的日志返回。
   sandbox.print = (...parts) => pushLog(logs, parts.map(printPart).join(' '))
-  sandbox.hooks = {
-    add(hookName, fn) {
-      if (typeof hookName !== 'string' || hookName.length === 0) {
-        throw new Error('hooks.add: 钩子名必须是非空字符串')
-      }
-      if (typeof fn !== 'function') throw new Error(`hooks.add(${JSON.stringify(hookName)}): 第二个参数必须是函数`)
-      let source
-      try { source = Function.prototype.toString.call(fn) } catch {
-        throw new Error(`hooks.add(${JSON.stringify(hookName)}): 无法读取函数源码`)
-      }
-      const replaced = hooks.has(hookName)
-      // 覆盖语义：同名只更新逻辑、保留原执行位置；
-      // 换位置用 hooks.order(...) 显式表达，两个动作正交。
-      hooks.set(hookName, source)
-      const msg = `钩子 ${JSON.stringify(hookName)} 已${replaced ? '覆盖（保持原执行位置）' : '注册'}（共 ${hooks.size} 个），将在每次 world_run 执行后、state diff 前自动运行。`
-      pushLog(logs, msg)
-      return msg
-    },
-    remove(hookName) {
-      const removed = hooks.delete(hookName)
-      pushLog(logs, removed ? `钩子 ${JSON.stringify(hookName)} 已删除。` : `钩子 ${JSON.stringify(hookName)} 不存在。`)
-      return removed
-    },
-    // list 的返回顺序即执行顺序（明文契约）。
-    list() { return [...hooks.entries()].map(([hookName, source]) => ({ name: hookName, source })) },
-    // 重排执行顺序：列出的钩子按给定顺序排前，未列出的保持相对顺序跟在后面；
-    // 未知名字与重复名字报错（防笔误）。顺序随 hooks.json 一并持久化。
-    order(names) {
-      if (!Array.isArray(names) || names.some((n) => typeof n !== 'string')) {
-        throw new Error('hooks.order: 参数必须是钩子名数组，例如 hooks.order(["a", "b"])')
-      }
-      const unknown = names.filter((n) => !hooks.has(n))
-      if (unknown.length > 0) {
-        throw new Error(`hooks.order: 未知钩子 ${unknown.map((n) => JSON.stringify(n)).join(', ')}（当前：${[...hooks.keys()].join(', ') || '无'}）`)
-      }
-      const dup = [...new Set(names.filter((n, i) => names.indexOf(n) !== i))]
-      if (dup.length > 0) {
-        throw new Error(`hooks.order: 名单中重复 ${dup.map((n) => JSON.stringify(n)).join(', ')}`)
-      }
-      const rest = [...hooks.keys()].filter((k) => !names.includes(k))
-      const seq = [...names, ...rest]
-      const entries = seq.map((k) => [k, hooks.get(k)])
-      hooks.clear()
-      for (const [k, v] of entries) hooks.set(k, v)
-      const msg = `钩子执行顺序已更新：${seq.join(' → ') || '（无钩子）'}`
-      pushLog(logs, msg)
-      return msg
-    },
-    clear() {
-      const n = hooks.size
-      hooks.clear()
-      pushLog(logs, `已清空 ${n} 个钩子。`)
-      return n
-    },
-  }
   vm.createContext(sandbox)
 
-  const rt = { context: sandbox, sandbox, cwd, logs, hooks, injectedKeys, stateFile: null, libFile: null, hooksFile: null }
+  const rt = { context: sandbox, sandbox, cwd, logs, injectedKeys, stateFile: null, libFile: null }
   if (cwd) {
     const dir = path.join(cwd, '.airp')
     rt.stateFile = path.join(dir, `${sessionId}.state.json`)
     rt.libFile = path.join(dir, `${sessionId}.lib.json`)
-    rt.hooksFile = path.join(dir, `${sessionId}.hooks.json`)
     // 恢复顺序：优先本会话事件流中最后一条 airp/state（fork 切片自动携带、
-    // 分支点精确）；旧会话没有该事件，回退读 .airp/ 三件套——自身文件不存在时
+    // 分支点精确）；旧会话没有该事件，回退读 .airp/ 文件——自身文件不存在时
     // （分支自旧格式会话）再回退父会话的文件（过渡期近似：父的当前状态可能
     // 领先分支点，父下次提交后事件通道接管即恢复精确）。
     const fromLog = lastStateEvent(agent.session)
@@ -255,11 +196,10 @@ async function runtimeFor(agent) {
     } else {
       const lib = (await readJsonSafe(rt.libFile)) ?? (await readJsonSafe(parentFileFor(agent, 'lib')))
       const state = (await readJsonSafe(rt.stateFile)) ?? (await readJsonSafe(parentFileFor(agent, 'state')))
-      const savedHooks = (await readJsonSafe(rt.hooksFile)) ?? (await readJsonSafe(parentFileFor(agent, 'hooks')))
-      hydrateRuntime(rt, { state, lib, hooks: savedHooks })
+      hydrateRuntime(rt, { state, lib })
       // 领养即钉住：立即以本会话 id 落盘并写入状态事件，避免父继续前进后
       // 本分支重复领养到"未来"状态，也让本分支之后的 fork 有事件可继承。
-      if (state || lib || savedHooks) {
+      if (state || lib) {
         try {
           await persistRuntime(rt, agent.session)
         } catch (error) {
@@ -272,9 +212,9 @@ async function runtimeFor(agent) {
   return rt
 }
 
-/** 把 { state, lib, hooks } 水合进运行时：先重放函数源码，再恢复 state 与钩子源码。 */
+/** 把 { state, lib } 水合进运行时：先重放函数源码，再恢复 state。 */
 function hydrateRuntime(rt, saved) {
-  const { sandbox, hooks } = rt
+  const { sandbox } = rt
   if (saved?.lib && typeof saved.lib === 'object') {
     for (const [key, source] of Object.entries(saved.lib)) {
       if (typeof source !== 'string' || !/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(key)) continue
@@ -287,20 +227,11 @@ function hydrateRuntime(rt, saved) {
     const snap = snapshotState(saved.state)
     if (snap.ok) sandbox.state = snap.value
   }
-  if (saved?.hooks && typeof saved.hooks === 'object') {
-    for (const [hookName, source] of Object.entries(saved.hooks)) {
-      if (typeof source !== 'string') continue
-      try {
-        const fn = vm.runInContext(`(${source})`, sandbox, { timeout: 5000 })
-        if (typeof fn === 'function') hooks.set(hookName, source)
-      } catch { /* 跳过损坏条目 */ }
-    }
-  }
 }
 
 // ── 会话日志内状态事件（方案 A：状态随 fork 切片自动携带） ──────────────────
 //
-// world_run 每次提交后把 { turn, state, lib, hooks } 作为 airp/state log-only
+// world_run 每次提交后把 { turn, state, lib } 作为 airp/state log-only
 // 事件写入会话日志（不进 surface/模型上下文/UI）。恢复时取本会话事件流中最后
 // 一条：fork 按边界切片 → 分支点精确状态；重启 → 最新；随会话导出/删除。
 // 事件携带 ignorable: true，需要 dsh-session 的本地补丁（append 透传 ignorable）；
@@ -356,15 +287,13 @@ async function persistRuntime(rt, session) {
   const state = snapshotState(rt.sandbox.state)
   if (!state.ok) return false
   const lib = collectLib(rt.sandbox, rt.injectedKeys)
-  const hooks = Object.fromEntries(rt.hooks)
   await fs.mkdir(path.dirname(rt.stateFile), { recursive: true })
   await fs.writeFile(rt.stateFile, JSON.stringify(state.value, null, 2), 'utf8')
   await fs.writeFile(rt.libFile, JSON.stringify(lib, null, 2), 'utf8')
-  await fs.writeFile(rt.hooksFile, JSON.stringify(hooks, null, 2), 'utf8')
   // 方案 A：状态随会话日志（fork 自动继承）。文件保持双写作为兜底与调试入口。
   if (session && supportsIgnorableEvents(session)) {
     try {
-      session.append('airp/state', { turn: currentTurn(session), state: state.value, lib, hooks }, { ignorable: true })
+      session.append('airp/state', { turn: currentTurn(session), state: state.value, lib }, { ignorable: true })
     } catch (error) {
       console.error('[airp-engine] 状态事件写入失败（文件已落盘，本会话不受影响）：', error)
     }
@@ -374,21 +303,18 @@ async function persistRuntime(rt, session) {
 
 // ── 运行时快照/恢复（原子执行与试运行的共同基础） ──────────────────────────
 
-/** 快照：state 深拷贝 + 钩子注册表 + 全局函数源码 + 全局键列表。state.ok=false 时无法回滚。 */
+/** 快照：state 深拷贝 + 全局函数源码 + 全局键列表。state.ok=false 时无法回滚。 */
 function snapshotRuntime(rt) {
   return {
     state: snapshotState(rt.sandbox.state),
-    hooks: [...rt.hooks.entries()],
     lib: collectLib(rt.sandbox, rt.injectedKeys),
     keys: new Set(Object.getOwnPropertyNames(rt.sandbox)),
   }
 }
 
-/** 恢复：重挂 state、还原钩子注册表、删除新增全局、还原被覆盖/删除的全局函数。 */
+/** 恢复：重挂 state、删除新增全局、还原被覆盖/删除的全局函数。 */
 function restoreRuntime(rt, snap) {
   if (snap.state.ok) rt.sandbox.state = snap.state.value
-  rt.hooks.clear()
-  for (const [k, v] of snap.hooks) rt.hooks.set(k, v)
   for (const key of Object.getOwnPropertyNames(rt.sandbox)) {
     if (!snap.keys.has(key)) { try { delete rt.sandbox[key] } catch { /* 忽略 */ } }
   }
@@ -406,7 +332,7 @@ function restoreRuntime(rt, snap) {
 function undefinedNameHint(message) {
   const m = /(\S+) is not defined/.exec(message)
   return m
-    ? `（提示：${m[1]} 未定义。程序体内的 function/const/let 声明都是局部的、调用结束即消失；跨调用或钩子要引用的辅助函数请定义为全局函数：globalThis.${m[1]} = ...）`
+    ? `（提示：${m[1]} 未定义。程序体内的 function/const/let 声明都是局部的、调用结束即消失；跨调用或 normalize 要引用的辅助函数请定义为全局函数：globalThis.${m[1]} = ...）`
     : ''
 }
 
@@ -440,27 +366,25 @@ async function runProgram(rt, program, dry, session) {
   }
   const hookErrors = []
   if (error) {
-    // 原子执行：用户代码出错 → 整体回滚（state、钩子注册表、本次新增/覆盖的全局函数），
-    // 不留下半更新的状态；state 已回滚，钩子无中间态可钳制，故不再执行。
+    // 原子执行：用户代码出错 → 整体回滚（state、本次新增/覆盖的全局函数），
+    // 不留下半更新的状态；state 已回滚，normalize 无中间态可整理，故不再执行。
     if (before.ok) {
       restoreRuntime(rt, snap)
       rolledBack = true
     }
   } else {
-    // 自动钩子：用户代码成功之后、state diff 之前，按注册顺序执行。
-    // 钩子级原子：单钩子出错只回滚它自己的改动并记录，不影响其余钩子与用户代码的成果；
-    // 钩子内的 print 与用户代码共用当次日志（提醒即日志）。
-    // 注意先拷贝条目再迭代：钩子可能注册新钩子，出错回滚也会重建注册表，
-    // 直接迭代 rt.hooks 会把删除后重插的条目当作新条目反复访问（死循环）。
-    for (const [hookName, source] of [...rt.hooks.entries()]) {
+    // 约定式整理：用户代码成功之后、state diff 之前，若存在全局函数 normalize
+    // 则自动调用一次（经 runInContext 触发，获得同步超时保护；异步部分走竞时上限）。
+    // 整理级原子：normalize 出错只回滚它自己的改动并记录，用户代码的成果不受影响；
+    // normalize 内的 print 与用户代码共用当次日志（提醒即日志）。
+    if (typeof rt.sandbox.normalize === 'function') {
       const hookSnap = snapshotRuntime(rt)
       try {
-        const fn = vm.runInContext(`(${source})`, rt.context, { timeout: VM_TIMEOUT_MS, filename: `hook-${hookName}.js` })
-        if (typeof fn !== 'function') throw new Error('钩子源码编译结果不是函数')
+        const result = vm.runInContext('normalize()', rt.context, { timeout: VM_TIMEOUT_MS, filename: 'normalize.js' })
         let timer
         try {
           await Promise.race([
-            Promise.resolve(fn()),
+            Promise.resolve(result),
             new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`异步执行超过 ${ASYNC_TIMEOUT_MS / 1000} 秒`)), ASYNC_TIMEOUT_MS) }),
           ])
         } finally {
@@ -468,7 +392,7 @@ async function runProgram(rt, program, dry, session) {
         }
       } catch (e) {
         const msg = String((e && e.message) || e)
-        hookErrors.push(`${hookName}：${msg}${undefinedNameHint(msg)}（该钩子的改动已回滚）`)
+        hookErrors.push(`normalize：${msg}${undefinedNameHint(msg)}（normalize 的改动已回滚）`)
         restoreRuntime(rt, hookSnap)
       }
     }
@@ -482,7 +406,7 @@ async function runProgram(rt, program, dry, session) {
   const diff = before.ok && after.ok ? diffJson(before.value, after.value) : []
   let persisted
   if (dry) {
-    // 试运行：无条件恢复到执行前，不落盘（state、钩子注册、函数定义全部还原）。
+    // 试运行：无条件恢复到执行前，不落盘（state、函数定义全部还原）。
     restoreRuntime(rt, snap)
     persisted = true // 不触发「仅内存」提示，由 dry 标注替代
   } else {
@@ -506,9 +430,9 @@ function formatRunResult(r) {
   } else if (!r.error) {
     parts.push('state 无变化。')
   }
-  if (r.hookErrors.length > 0) parts.push(`钩子错误：\n${r.hookErrors.map((e) => `  - ${e}`).join('\n')}`)
-  if (r.rolledBack) parts.push('已回滚：执行出错，state、钩子注册与函数定义均已恢复到执行前，未留下半更新。')
-  if (r.dry) parts.push('（试运行：以上变化、钩子注册与函数定义均未生效。）')
+  if (r.hookErrors.length > 0) parts.push(`normalize 错误：\n${r.hookErrors.map((e) => `  - ${e}`).join('\n')}`)
+  if (r.rolledBack) parts.push('已回滚：执行出错，state 与函数定义均已恢复到执行前，未留下半更新。')
+  if (r.dry) parts.push('（试运行：以上变化与函数定义均未生效。）')
   else if (!r.persisted) parts.push('（注意：本会话无工作目录，状态仅保留在内存中，进程重启后丢失。）')
   return parts.join('\n\n')
 }
@@ -970,13 +894,12 @@ function apply(ctx, config) {
       '约定：所有需要追踪的游戏数据放进 state；辅助函数必须定义为全局函数才能跨调用保留：' +
       '用 globalThis.foo = function...（或裸赋值 foo = ...）。注意：程序体内的 function foo(){}、const、let 声明都是本次调用的局部量，调用结束即消失；' +
       '代码作为 async 函数体执行，可用顶层 await/return。' +
-      '输出：print(...值) 把任意值（可多个、含不可 JSON 化的对象）写入当次日志返回；return 返回单个值。注意return和钩子外的print会输出钩子执行前的值。钩子执行后的值会在state diff中自动返回' +
-      '原子执行：代码出错时自动回滚到执行前（state、钩子注册、函数定义全部还原），不会留下半更新的状态。' +
-      '排错：传 dry:true 试运行——照常执行并返回完整结果（含钩子效果与 diff），但一切变化不生效，适合复杂更新前确认效果。' +
-      '自动钩子：hooks.add(名字, 函数) 注册后，每次执行成功后、生成 state diff 之前都会按注册顺序自动运行所有钩子，' +
-      '同名 add 只更新逻辑、保持原执行位置；hooks.order([名字…]) 重排执行顺序（未列出的保持相对顺序跟在后面），hooks.list() 按执行顺序返回所有钩子；' +
-      'hooks.remove(名字)/clear() 删除，钩子源码与顺序跨调用自动持久化；单个钩子出错只回滚它自己的改动并记录，不影响其余钩子。' +
-      '每次执行返回：返回值、日志、state 的变化 diff、钩子错误（如有）。',
+      '输出：print(...值) 把任意值（可多个、含不可 JSON 化的对象）写入当次日志返回；return 返回单个值。注意return和normalize外的print会输出normalize执行前的值。normalize执行后的值会在state diff中自动返回' +
+      '原子执行：代码出错时自动回滚到执行前（state、函数定义全部还原），不会留下半更新的状态。' +
+      '自动整理：如果你定义了全局函数 normalize()（globalThis.normalize = function...），每次代码成功执行后、生成 state diff 之前框架会自动调用它一次；' +
+      '把变量钳制（如 if (state.hp < 0) state.hp = 0）、阈值提醒（函数里 print 即提醒）、派生量自动更新写在里面避免遗忘' +
+      'normalize 与普通全局函数一样自动持久化，重定义即更新，赋 undefined 即停用；normalize 出错只回滚它自己的改动并记录，不影响用户代码的成果。' +
+      '每次执行返回：返回值、日志、state 的变化 diff、normalize 错误（如有）。',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -988,7 +911,7 @@ function apply(ctx, config) {
         },
         dry: {
           type: 'boolean',
-          description: '试运行：照常执行并返回完整结果（含钩子效果与 state diff），但不提交任何变化（state、钩子注册、函数定义全部还原）。用于复杂更新前排错确认。',
+          description: '试运行：照常执行并返回完整结果（含 normalize 效果与 state diff），但不提交任何变化（state、函数定义全部还原）。用于复杂更新前排错确认。',
         },
       },
     },
