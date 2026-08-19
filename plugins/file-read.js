@@ -1,7 +1,8 @@
 // file-read: AIRP 预设的只读文件工具。
 //
-// 提供 `read_file` 工具：读取一个 UTF-8 文本文件，返回带行号的内容窗口，
-// 供世界引擎叙事时引用玩家提供或工作区中的设定文档、笔记、角色卡等。
+// 提供 `read_file` 工具：读取一个 UTF-8 文本文件，返回内容窗口（正文纯文本，
+// 分页信息在末尾），供世界引擎叙事时引用玩家提供或工作区中的设定文档、笔记、
+// 角色卡等。
 // 相对路径以会话工作目录为基准（与 airp-engine 的持久化目录同源），
 // 也接受绝对路径；可用 offset/limit 分页读取大文件。
 //
@@ -65,18 +66,19 @@ function buildWindow(text, request) {
   return { lines: out, totalLines, truncatedByBytes }
 }
 
-/** 把读取结果格式化成模型可见的文本块。 */
+/** 把读取结果格式化成模型可见的文本块（正文不带行号：本工具只读不写，
+ *  行号对"按行编辑"才有意义；footer 保留窗口边界行号供分页续读）。 */
 function formatReadOutput(displayPath, window, offset) {
   const endLine = window.lines.length > 0 ? window.lines[window.lines.length - 1].number : Math.max(0, offset - 1)
   let footer
   if (window.truncatedByBytes) {
-    footer = `(输出已达字节上限，仅显示 ${offset}-${endLine} 行；用 offset=${endLine + 1} 继续读取。)`
+    footer = `(输出已达字节上限，仅显示至第 ${endLine} 行；用 offset=${endLine + 1} 继续读取。)`
   } else if (endLine < window.totalLines) {
-    footer = `(共 ${window.totalLines} 行，当前显示 ${offset}-${endLine}；用 offset=${endLine + 1} 继续读取。)`
+    footer = `(共 ${window.totalLines} 行，当前显示至第 ${endLine} 行；用 offset=${endLine + 1} 继续读取。)`
   } else {
     footer = `(文件结束 - 共 ${window.totalLines} 行)`
   }
-  const body = window.lines.map((line) => `${line.number}: ${line.text}`).join('\n')
+  const body = window.lines.map((line) => line.text).join('\n')
   return `<path>${displayPath}</path>\n<type>file</type>\n<content>\n${body ? `${body}\n\n${footer}` : footer}\n</content>`
 }
 
@@ -84,10 +86,10 @@ function apply(ctx) {
   ctx.tools.register({
     name: 'read_file',
     description:
-      '读取一个 UTF-8 文本文件并返回带行号的内容窗口。' +
+      '读取一个 UTF-8 文本文件并返回其内容。' +
       '用于读取玩家提供或工作区中的设定文档、笔记、角色卡、存档等文本文件；' +
       '相对路径以会话工作目录为基准，也支持绝对路径；' +
-      '大文件可用 offset/limit 分页继续读取。',
+      '大文件可用 offset/limit 分页继续读取（分页信息在返回末尾）。',
     parameters: {
       type: 'object',
       additionalProperties: false,
